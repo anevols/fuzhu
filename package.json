@@ -1,0 +1,21 @@
+{
+  "name": "tunnel-console",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.5.2",
+  "scripts": {
+    "dev": "pnpm --parallel --filter @tunnel/server --filter @tunnel/web dev",
+    "dev:server": "pnpm --filter @tunnel/server dev",
+    "dev:agent": "pnpm --filter @tunnel/agent dev",
+    "dev:web": "pnpm --filter @tunnel/web dev",
+    "build": "pnpm --filter @tunnel/web build && pnpm --filter @tunnel/server build && pnpm --filter @tunnel/agent build",
+    "start": "pnpm --filter @tunnel/server start",
+    "typecheck": "pnpm -r typecheck"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}
