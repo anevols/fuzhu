@@ -395,7 +395,11 @@ function OverviewPage({ data }: { data: OverviewResponse }) {
         <Stat
           label="在线客户端"
           value={`${data.server.onlineClients} / ${data.server.totalClients}`}
-          hint="Agent 已建立连接"
+          hint={
+            data.server.onlineClients > 0
+              ? `${data.server.onlineClients} 个 Agent 在线`
+              : '暂无 Agent 连接'
+          }
           tone="accent"
         />
         <Stat
