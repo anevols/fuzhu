@@ -1,4 +1,5 @@
 import net from 'node:net';
+import dgram from 'node:dgram';
 import { WebSocket } from 'ws';
 import {
   FRAME,
@@ -104,6 +105,7 @@ class Agent {
   private ws: WebSocket | null = null;
   private readonly tunnels = new Map<string, TunnelSpec>();
   private readonly streams = new Map<number, net.Socket>();
+  private readonly udpStreams = new Map<number, dgram.Socket>();
   private reconnectAttempt = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private heartbeat: NodeJS.Timeout | null = null;
@@ -189,10 +191,18 @@ class Agent {
       case FRAME.Open:
         this.handleOpen(streamId, decodeJson<OpenRequest>(payload));
         break;
-      case FRAME.Data:
-        this.streams.get(streamId)?.write(payload);
+      case FRAME.Data: {
+        const udp = this.udpStreams.get(streamId);
+        if (udp) udp.send(payload);
+        else this.streams.get(streamId)?.write(payload);
         break;
+      }
       case FRAME.Close: {
+        const udp = this.udpStreams.get(streamId);
+        if (udp) {
+          this.dropUdpStream(streamId, udp, false);
+          break;
+        }
         const socket = this.streams.get(streamId);
         if (socket) this.dropStream(streamId, socket, false);
         break;
@@ -234,6 +244,11 @@ class Agent {
     const tunnel = this.tunnels.get(payload.tunnelId);
     if (!tunnel) {
       this.sendJson(FRAME.OpenError, streamId, { message: '隧道配置已失效，请重新同步' });
+      return;
+    }
+
+    if (tunnel.protocol === 'udp') {
+      this.handleUdpOpen(streamId, tunnel);
       return;
     }
 
@@ -279,6 +294,64 @@ class Agent {
     });
   }
 
+  private handleUdpOpen(streamId: number, tunnel: TunnelSpec): void {
+    const previous = this.udpStreams.get(streamId);
+    if (previous) {
+      try {
+        previous.close();
+      } catch {
+        // ignore
+      }
+      this.udpStreams.delete(streamId);
+    }
+
+    const socket = dgram.createSocket('udp4');
+    this.udpStreams.set(streamId, socket);
+
+    socket.on('message', (message) => {
+      this.sendFrame(FRAME.Data, streamId, message);
+    });
+
+    socket.on('error', (error) => {
+      if (this.udpStreams.get(streamId) !== socket) return;
+      this.udpStreams.delete(streamId);
+      this.sendJson(FRAME.OpenError, streamId, { message: error.message });
+      this.log('warn', `[${tunnel.name}] UDP 连接异常: ${error.message}`);
+      try {
+        socket.close();
+      } catch {
+        // ignore
+      }
+    });
+
+    try {
+      socket.connect(tunnel.localPort, tunnel.localHost, () => {
+        if (this.udpStreams.get(streamId) !== socket) return;
+        this.sendFrame(FRAME.OpenOk, streamId);
+        this.log('debug', `[${tunnel.name}] UDP 连接内网服务 ${tunnel.localHost}:${tunnel.localPort}`);
+      });
+    } catch (error) {
+      this.udpStreams.delete(streamId);
+      this.sendJson(FRAME.OpenError, streamId, { message: (error as Error).message });
+      try {
+        socket.close();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  private dropUdpStream(streamId: number, socket: dgram.Socket, notify: boolean): void {
+    if (this.udpStreams.get(streamId) !== socket) return;
+    this.udpStreams.delete(streamId);
+    try {
+      socket.close();
+    } catch {
+      // ignore
+    }
+    if (notify) this.sendFrame(FRAME.Close, streamId);
+  }
+
   private failStream(streamId: number, socket: net.Socket, message: string): void {
     if (this.streams.get(streamId) !== socket) return;
     this.streams.delete(streamId);
@@ -303,6 +376,14 @@ class Agent {
       socket.destroy();
     }
     this.streams.clear();
+    for (const socket of this.udpStreams.values()) {
+      try {
+        socket.close();
+      } catch {
+        // ignore
+      }
+    }
+    this.udpStreams.clear();
     this.tunnels.clear();
     this.ws = null;
   }

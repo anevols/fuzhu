@@ -5,6 +5,7 @@ import cookie from '@fastify/cookie';
 import fastifyStatic from '@fastify/static';
 import { WebSocketServer } from 'ws';
 import { registerApi } from './api';
+import { CertStore } from './certs';
 import { config } from './config';
 import { Store } from './db';
 import { AgentHub, TrafficStore } from './hub';
@@ -24,7 +25,8 @@ async function main(): Promise<void> {
 
   const traffic = new TrafficStore();
   const hub = new AgentHub(store, traffic, app.log, config.version);
-  const tunnelManager = new TunnelManager(store, hub, app.log);
+  const certStore = new CertStore(config.certDir, config, app.log);
+  const tunnelManager = new TunnelManager(store, hub, app.log, certStore, config);
 
   hub.setHooks({
     onClientOnline: () => {
@@ -75,6 +77,7 @@ async function main(): Promise<void> {
       id: newId(),
       username: config.adminUsername,
       password_hash: hashPassword(password),
+      role: 'admin',
       created_at: Date.now(),
     });
     app.log.info(`已创建管理员账号: ${config.adminUsername}`);
@@ -89,11 +92,28 @@ async function main(): Promise<void> {
   await app.listen({ host: config.host, port: config.port });
   app.log.info(`控制台地址: http://${config.host}:${config.port}`);
   app.log.info(`Agent 接入地址: ws://${config.host}:${config.port}/agent`);
+  await tunnelManager.reconcile();
+  app.log.info(
+    {
+      httpPort: config.httpPort,
+      httpsPort: config.httpsPort,
+      httpRouter: config.httpRouter,
+      acme: Boolean(config.acmeEmail),
+    },
+    'http/https domain router configured',
+  );
+
+  // 定期 reconcile：重试失败监听、加载 ACME 续期后的新证书
+  const maintenance = setInterval(() => {
+    void tunnelManager.reconcile();
+  }, 6 * 60 * 60 * 1000);
+  maintenance.unref();
 
   let closing = false;
   const shutdown = async (signal: string): Promise<void> => {
     if (closing) return;
     closing = true;
+    clearInterval(maintenance);
     app.log.info({ signal }, 'shutting down');
     wss.close();
     hub.closeAll();

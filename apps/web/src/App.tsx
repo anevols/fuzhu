@@ -10,12 +10,16 @@ import {
   ApiError,
   api,
   type ClientInfo,
+  type CertInfo,
   type OverviewResponse,
   type TunnelInfo,
+  type TunnelProtocol,
   type TunnelStatus,
+  type UserInfo,
+  type UserRole,
 } from './api';
 
-type Page = 'overview' | 'clients' | 'tunnels';
+type Page = 'overview' | 'clients' | 'tunnels' | 'users';
 type ToastKind = 'ok' | 'error';
 interface Toast {
   id: number;
@@ -79,6 +83,7 @@ type IconName =
   | 'grid'
   | 'server'
   | 'route'
+  | 'users'
   | 'logout'
   | 'plus'
   | 'edit'
@@ -110,6 +115,13 @@ const ICON_PATHS: Record<IconName, ReactNode> = {
       <circle cx="6" cy="6" r="2.5" />
       <circle cx="18" cy="18" r="2.5" />
       <path d="M8.5 6H14a4 4 0 0 1 0 8h-4a4 4 0 0 0 0 4h5.5" />
+    </>
+  ),
+  users: (
+    <>
+      <circle cx="9" cy="8" r="3.2" />
+      <path d="M3.5 19.5c0-3 2.5-5 5.5-5s5.5 2 5.5 5" />
+      <path d="M16 5.5a3 3 0 0 1 0 5.6M17 14.8c2.2.4 3.5 2.1 3.5 4.7" />
     </>
   ),
   logout: (
@@ -293,7 +305,7 @@ function Field({
   );
 }
 
-function Login({ onLogin }: { onLogin: (user: { username: string }) => void }) {
+function Login({ onLogin }: { onLogin: (user: UserInfo) => void }) {
   const [username, setUsername] = useState('admin');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
@@ -395,7 +407,7 @@ function OverviewPage({ data }: { data: OverviewResponse }) {
         <Stat
           label="活跃连接"
           value={String(activeConnections)}
-          hint="当前经过隧道的 TCP 连接"
+          hint="当前经过隧道的 TCP/UDP 连接"
           tone="blue"
         />
         <Stat
@@ -503,6 +515,20 @@ function OverviewPage({ data }: { data: OverviewResponse }) {
               : '暂无'}
           </strong>
         </div>
+        {data.server.http.enabled ? (
+          <div className="meta-item">
+            <span>HTTP / HTTPS</span>
+            <strong className="mono">
+              :{data.server.http.port} / :{data.server.http.httpsPort}
+              {' · '}
+              {data.server.http.listening ? 'HTTP 已监听' : 'HTTP 未监听'}
+              {' · '}
+              {data.server.http.httpsListening ? 'HTTPS 已监听' : 'HTTPS 未监听'}
+              {' · '}
+              {data.server.http.acme ? 'ACME 证书' : '自签名证书'}
+            </strong>
+          </div>
+        ) : null}
       </section>
     </>
   );
@@ -635,10 +661,12 @@ function ClientsPage({
   clients,
   changed,
   notify,
+  showOwner,
 }: {
   clients: ClientInfo[];
   changed: () => Promise<void>;
   notify: (message: string, kind?: ToastKind) => void;
+  showOwner: boolean;
 }) {
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<ClientInfo | null>(null);
@@ -723,6 +751,7 @@ function ClientsPage({
               <thead>
                 <tr>
                   <th>名称</th>
+                  {showOwner ? <th>所属用户</th> : null}
                   <th>状态</th>
                   <th>令牌</th>
                   <th>隧道</th>
@@ -738,6 +767,9 @@ function ClientsPage({
                       <div className="cell-title">{client.name}</div>
                       {client.note ? <div className="cell-sub">{client.note}</div> : null}
                     </td>
+                    {showOwner ? (
+                      <td className="muted">{client.ownerName ?? '—'}</td>
+                    ) : null}
                     <td>
                       <OnlineBadge online={client.online} />
                     </td>
@@ -816,24 +848,42 @@ interface TunnelFormProps {
 
 function TunnelFormModal({ clients, editing, onClose, onSaved, notify }: TunnelFormProps) {
   const [clientId, setClientId] = useState(editing?.clientId ?? clients[0]?.id ?? '');
+  const [protocol, setProtocol] = useState<TunnelProtocol>(editing?.protocol ?? 'tcp');
   const [name, setName] = useState(editing?.name ?? '');
   const [localHost, setLocalHost] = useState(editing?.localHost ?? '127.0.0.1');
   const [localPort, setLocalPort] = useState(String(editing?.localPort ?? 80));
-  const [remotePort, setRemotePort] = useState(String(editing?.remotePort ?? ''));
+  const [remotePort, setRemotePort] = useState(
+    editing && editing.protocol !== 'http' ? String(editing.remotePort) : '',
+  );
+  const [domains, setDomains] = useState(editing?.domains.join('\n') ?? '');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     const local = Number(localPort);
-    const remote = Number(remotePort);
     if (!Number.isInteger(local) || local < 1 || local > 65535) {
       setError('内网端口必须是 1-65535 的整数');
       return;
     }
-    if (!Number.isInteger(remote) || remote < 1 || remote > 65535) {
-      setError('公网端口必须是 1-65535 的整数');
-      return;
+
+    const parsedDomains = domains
+      .split(/[\s,]+/)
+      .map((item) => item.trim().toLowerCase())
+      .filter(Boolean);
+
+    let remote: number | undefined;
+    if (protocol === 'http') {
+      if (parsedDomains.length === 0) {
+        setError('HTTP 隧道至少需要一个域名');
+        return;
+      }
+    } else {
+      remote = Number(remotePort);
+      if (!Number.isInteger(remote) || remote < 1 || remote > 65535) {
+        setError('公网端口必须是 1-65535 的整数');
+        return;
+      }
     }
 
     setBusy(true);
@@ -844,16 +894,27 @@ function TunnelFormModal({ clients, editing, onClose, onSaved, notify }: TunnelF
           name: name.trim(),
           localHost: localHost.trim(),
           localPort: local,
-          remotePort: remote,
+          ...(protocol === 'http' ? { domains: parsedDomains } : { remotePort: remote }),
         });
         notify('隧道已更新');
+      } else if (protocol === 'http') {
+        await api.createTunnel({
+          clientId,
+          name: name.trim(),
+          protocol,
+          localHost: localHost.trim(),
+          localPort: local,
+          domains: parsedDomains,
+        });
+        notify('HTTP 隧道已创建');
       } else {
         await api.createTunnel({
           clientId,
           name: name.trim(),
+          protocol,
           localHost: localHost.trim(),
           localPort: local,
-          remotePort: remote,
+          remotePort: remote as number,
         });
         notify('隧道已创建');
       }
@@ -869,9 +930,9 @@ function TunnelFormModal({ clients, editing, onClose, onSaved, notify }: TunnelF
   return (
     <Modal
       title={editing ? '编辑隧道' : '新建隧道'}
-      subtitle="把公网端口转发到某台客户端所在内网的服务"
+      subtitle="把公网流量转发到某台客户端所在内网的服务"
       onClose={onClose}
-      width={520}
+      width={540}
     >
       <form className="form" onSubmit={submit}>
         <Field label="隧道名称">
@@ -898,6 +959,24 @@ function TunnelFormModal({ clients, editing, onClose, onSaved, notify }: TunnelF
             ))}
           </select>
         </Field>
+        <Field
+          label="协议"
+          hint={
+            editing
+              ? '协议创建后不可修改，需要切换请新建隧道'
+              : 'TCP/UDP 使用独立公网端口；HTTP 使用共享的 80/443 并按域名路由'
+          }
+        >
+          <select
+            value={protocol}
+            onChange={(event) => setProtocol(event.target.value as TunnelProtocol)}
+            disabled={Boolean(editing)}
+          >
+            <option value="tcp">TCP 端口转发</option>
+            <option value="udp">UDP 端口转发</option>
+            <option value="http">HTTP 域名 + 自动 HTTPS</option>
+          </select>
+        </Field>
         <div className="field-row">
           <Field label="内网地址">
             <input
@@ -907,7 +986,7 @@ function TunnelFormModal({ clients, editing, onClose, onSaved, notify }: TunnelF
               required
             />
           </Field>
-          <Field label="内网端口">
+          <Field label={protocol === 'udp' ? '内网 UDP 端口' : '内网端口'}>
             <input
               value={localPort}
               onChange={(event) => setLocalPort(event.target.value)}
@@ -917,15 +996,37 @@ function TunnelFormModal({ clients, editing, onClose, onSaved, notify }: TunnelF
             />
           </Field>
         </div>
-        <Field label="公网端口" hint="在服务器上监听的端口，客户端连上后自动生效">
-          <input
-            value={remotePort}
-            onChange={(event) => setRemotePort(event.target.value)}
-            inputMode="numeric"
-            placeholder="例如：6000"
-            required
-          />
-        </Field>
+        {protocol === 'http' ? (
+          <Field
+            label="域名"
+            hint="每行一个域名，DNS 需解析到本服务器；HTTP 与 HTTPS 自动生效"
+          >
+            <textarea
+              value={domains}
+              onChange={(event) => setDomains(event.target.value)}
+              rows={3}
+              placeholder={'app.example.com\napi.example.com'}
+              required
+            />
+          </Field>
+        ) : (
+          <Field
+            label="公网端口"
+            hint={
+              protocol === 'udp'
+                ? '在服务器上监听的 UDP 端口，客户端连上后自动生效'
+                : '在服务器上监听的 TCP 端口，客户端连上后自动生效'
+            }
+          >
+            <input
+              value={remotePort}
+              onChange={(event) => setRemotePort(event.target.value)}
+              inputMode="numeric"
+              placeholder="例如：6000"
+              required
+            />
+          </Field>
+        )}
         {error ? <div className="form-error">{error}</div> : null}
         <div className="modal-actions">
           <button type="button" className="btn ghost" onClick={onClose}>
@@ -979,7 +1080,11 @@ function TunnelsPage({
   };
 
   const remove = async (tunnel: TunnelInfo) => {
-    if (!window.confirm(`确定删除隧道「${tunnel.name}」？公网端口 ${tunnel.remotePort} 会被释放。`)) {
+    const target =
+      tunnel.protocol === 'http'
+        ? tunnel.domains.join(', ')
+        : `公网端口 ${tunnel.remotePort}`;
+    if (!window.confirm(`确定删除隧道「${tunnel.name}」？${target} 会被释放。`)) {
       return;
     }
     setBusyId(tunnel.id);
@@ -1031,6 +1136,7 @@ function TunnelsPage({
               <thead>
                 <tr>
                   <th>名称</th>
+                  <th>协议</th>
                   <th>客户端</th>
                   <th>转发规则</th>
                   <th>状态</th>
@@ -1048,13 +1154,27 @@ function TunnelsPage({
                         <div className="cell-sub danger-text">{tunnel.error}</div>
                       ) : null}
                     </td>
+                    <td>
+                      <span
+                        className={`badge ${tunnel.protocol === 'http' ? 'ok' : 'muted'}`}
+                      >
+                        {PROTOCOL_LABEL[tunnel.protocol] ?? tunnel.protocol}
+                      </span>
+                    </td>
                     <td className="muted">{tunnel.clientName}</td>
                     <td>
                       <span className="route mono">
-                        :{tunnel.remotePort}
+                        {routeLabel(tunnel)}
                         <span className="route-arrow">→</span>
                         {tunnel.localHost}:{tunnel.localPort}
                       </span>
+                      {tunnel.protocol === 'http' && tunnel.certs.length > 0 ? (
+                        <div className="cell-sub">
+                          {tunnel.certs
+                            .map((cert) => `${cert.domain}: ${certLabel(cert)}`)
+                            .join(' · ')}
+                        </div>
+                      ) : null}
                     </td>
                     <td>
                       <StatusBadge status={tunnel.status} />
@@ -1119,6 +1239,280 @@ function TunnelsPage({
   );
 }
 
+function UserFormModal({
+  onClose,
+  onSaved,
+  notify,
+}: {
+  onClose: () => void;
+  onSaved: () => Promise<void>;
+  notify: (message: string, kind?: ToastKind) => void;
+}) {
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [role, setRole] = useState<UserRole>('member');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (password.length < 6) {
+      setError('密码至少 6 位');
+      return;
+    }
+    setBusy(true);
+    setError('');
+    try {
+      await api.createUser({ username: username.trim(), password, role });
+      notify('用户已创建');
+      await onSaved();
+      onClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '创建失败');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal title="新建用户" subtitle="成员只能看到并管理自己名下的客户端" onClose={onClose} width={440}>
+      <form className="form" onSubmit={submit}>
+        <Field label="用户名" hint="3-64 位，支持字母、数字、下划线、点和短横线">
+          <input
+            value={username}
+            onChange={(event) => setUsername(event.target.value)}
+            minLength={3}
+            maxLength={64}
+            required
+            autoFocus
+          />
+        </Field>
+        <Field label="初始密码" hint="至少 6 位，可在创建后重置">
+          <input
+            type="password"
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+            minLength={6}
+            required
+          />
+        </Field>
+        <Field label="角色">
+          <select
+            value={role}
+            onChange={(event) => setRole(event.target.value as UserRole)}
+          >
+            <option value="member">成员 · 仅管理自己的客户端</option>
+            <option value="admin">管理员 · 全局管理</option>
+          </select>
+        </Field>
+        {error ? <div className="form-error">{error}</div> : null}
+        <div className="modal-actions">
+          <button type="button" className="btn ghost" onClick={onClose}>
+            取消
+          </button>
+          <button type="submit" className="btn primary" disabled={busy}>
+            {busy ? '创建中...' : '创建用户'}
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+function UsersPage({ notify }: { notify: (message: string, kind?: ToastKind) => void }) {
+  const [users, setUsers] = useState<UserInfo[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [creating, setCreating] = useState(false);
+  const [busyId, setBusyId] = useState('');
+
+  const load = useCallback(async () => {
+    try {
+      const result = await api.users();
+      setUsers(result.users);
+      setError('');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '加载失败');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const resetPassword = async (user: UserInfo) => {
+    const password = window.prompt(`为「${user.username}」设置新密码（至少 6 位）`);
+    if (!password) return;
+    if (password.length < 6) {
+      notify('密码至少 6 位', 'error');
+      return;
+    }
+    setBusyId(user.id);
+    try {
+      await api.updateUser(user.id, { password });
+      notify('密码已重置，该用户需要重新登录');
+    } catch (err) {
+      notify(err instanceof Error ? err.message : '重置失败', 'error');
+    } finally {
+      setBusyId('');
+    }
+  };
+
+  const toggleRole = async (user: UserInfo) => {
+    const next: UserRole = user.role === 'admin' ? 'member' : 'admin';
+    if (
+      !window.confirm(
+        `确定把「${user.username}」${next === 'admin' ? '设为管理员' : '降为成员'}吗？`,
+      )
+    ) {
+      return;
+    }
+    setBusyId(user.id);
+    try {
+      await api.updateUser(user.id, { role: next });
+      notify('角色已更新');
+      await load();
+    } catch (err) {
+      notify(err instanceof Error ? err.message : '更新失败', 'error');
+    } finally {
+      setBusyId('');
+    }
+  };
+
+  const remove = async (user: UserInfo) => {
+    if (
+      !window.confirm(
+        `确定删除用户「${user.username}」？其名下的客户端会移交给当前管理员。`,
+      )
+    ) {
+      return;
+    }
+    setBusyId(user.id);
+    try {
+      await api.deleteUser(user.id);
+      notify('用户已删除');
+      await load();
+    } catch (err) {
+      notify(err instanceof Error ? err.message : '删除失败', 'error');
+    } finally {
+      setBusyId('');
+    }
+  };
+
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <div>
+          <h2>控制台用户</h2>
+          <p className="muted">管理员可查看全部客户端，成员只能访问自己创建的资源。</p>
+        </div>
+        <button type="button" className="btn primary" onClick={() => setCreating(true)}>
+          <Icon name="plus" />
+          新建用户
+        </button>
+      </div>
+
+      {error ? <div className="alert">{error}</div> : null}
+
+      {loading ? (
+        <div className="empty">正在加载...</div>
+      ) : (
+        <div className="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>用户名</th>
+                <th>角色</th>
+                <th>客户端</th>
+                <th>创建时间</th>
+                <th className="right">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {users.map((user) => (
+                <tr key={user.id}>
+                  <td>
+                    <div className="cell-title">{user.username}</div>
+                  </td>
+                  <td>
+                    <span className={`badge ${user.role === 'admin' ? 'ok' : 'muted'}`}>
+                      {user.role === 'admin' ? '管理员' : '成员'}
+                    </span>
+                  </td>
+                  <td className="muted">{user.clientCount ?? 0}</td>
+                  <td className="muted">
+                    {user.createdAt
+                      ? new Date(user.createdAt).toLocaleString('zh-CN', { hour12: false })
+                      : '—'}
+                  </td>
+                  <td className="right">
+                    <div className="row-actions">
+                      <button
+                        type="button"
+                        className="btn ghost small"
+                        disabled={busyId === user.id}
+                        onClick={() => void resetPassword(user)}
+                      >
+                        重置密码
+                      </button>
+                      <button
+                        type="button"
+                        className="btn ghost small"
+                        disabled={busyId === user.id}
+                        onClick={() => void toggleRole(user)}
+                      >
+                        {user.role === 'admin' ? '设为成员' : '设为管理员'}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn danger small"
+                        disabled={busyId === user.id}
+                        onClick={() => void remove(user)}
+                      >
+                        删除
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {creating ? (
+        <UserFormModal
+          onClose={() => setCreating(false)}
+          onSaved={load}
+          notify={notify}
+        />
+      ) : null}
+    </section>
+  );
+}
+
+const PROTOCOL_LABEL: Record<TunnelProtocol, string> = {
+  tcp: 'TCP',
+  udp: 'UDP',
+  http: 'HTTP',
+};
+
+function routeLabel(tunnel: TunnelInfo): string {
+  if (tunnel.protocol === 'http') {
+    return tunnel.domains.length > 0 ? tunnel.domains.join(', ') : '未配置域名';
+  }
+  return `:${tunnel.remotePort}`;
+}
+
+function certLabel(cert: CertInfo): string {
+  if (cert.mode === 'acme') return 'ACME';
+  if (cert.mode === 'self-signed') return '自签名';
+  if (cert.mode === 'pending') return '签发中';
+  return cert.error ? `异常：${cert.error}` : '异常';
+}
+
 const NAV_ITEMS: Array<{ key: Page; label: string; icon: IconName; title: string; subtitle: string }> =
   [
     {
@@ -1140,7 +1534,14 @@ const NAV_ITEMS: Array<{ key: Page; label: string; icon: IconName; title: string
       label: '隧道',
       icon: 'route',
       title: '隧道',
-      subtitle: '配置公网到内网的端口转发',
+      subtitle: '配置 TCP / UDP / HTTP 转发规则',
+    },
+    {
+      key: 'users',
+      label: '用户',
+      icon: 'users',
+      title: '用户',
+      subtitle: '管理控制台账号与权限',
     },
   ];
 
@@ -1148,7 +1549,7 @@ function ConsoleView({
   user,
   onSessionLost,
 }: {
-  user: { username: string };
+  user: UserInfo;
   onSessionLost: () => void;
 }) {
   const [page, setPage] = useState<Page>('overview');
@@ -1201,7 +1602,8 @@ function ConsoleView({
     }
   };
 
-  const active = NAV_ITEMS.find((item) => item.key === page) ?? NAV_ITEMS[0]!;
+  const visibleNav = NAV_ITEMS.filter((item) => item.key !== 'users' || user.role === 'admin');
+  const active = visibleNav.find((item) => item.key === page) ?? visibleNav[0]!;
 
   return (
     <div className="app">
@@ -1215,7 +1617,7 @@ function ConsoleView({
         </div>
 
         <nav className="nav">
-          {NAV_ITEMS.map((item) => (
+          {visibleNav.map((item) => (
             <button
               key={item.key}
               type="button"
@@ -1232,7 +1634,7 @@ function ConsoleView({
           <div className="avatar">{user.username.slice(0, 1).toUpperCase()}</div>
           <div className="user-meta">
             <strong>{user.username}</strong>
-            <span>管理员</span>
+            <span>{user.role === 'admin' ? '管理员' : '成员'}</span>
           </div>
           <button type="button" className="icon-btn" title="退出登录" onClick={() => void logout()}>
             <Icon name="logout" />
@@ -1273,17 +1675,24 @@ function ConsoleView({
             <span className="spinner" />
             正在加载数据...
           </div>
-        ) : page === 'overview' ? (
+        ) : active.key === 'overview' ? (
           <OverviewPage data={data} />
-        ) : page === 'clients' ? (
-          <ClientsPage clients={data.clients} changed={() => load(true)} notify={notify} />
-        ) : (
+        ) : active.key === 'clients' ? (
+          <ClientsPage
+            clients={data.clients}
+            changed={() => load(true)}
+            notify={notify}
+            showOwner={user.role === 'admin'}
+          />
+        ) : active.key === 'tunnels' ? (
           <TunnelsPage
             tunnels={data.tunnels}
             clients={data.clients}
             changed={() => load(true)}
             notify={notify}
           />
+        ) : (
+          <UsersPage notify={notify} />
         )}
       </main>
 
@@ -1300,7 +1709,7 @@ function ConsoleView({
 }
 
 export default function App() {
-  const [user, setUser] = useState<{ username: string } | null>(null);
+  const [user, setUser] = useState<UserInfo | null>(null);
   const [checking, setChecking] = useState(true);
 
   useEffect(() => {

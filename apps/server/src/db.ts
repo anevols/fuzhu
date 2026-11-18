@@ -6,10 +6,13 @@ import type { DatabaseSync as DatabaseSyncInstance } from 'node:sqlite';
 // 通过 createRequire 加载，避免打包器把 node:sqlite 误判为第三方包
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
 
+export type UserRole = 'admin' | 'member';
+
 export interface UserRow {
   id: string;
   username: string;
   password_hash: string;
+  role: UserRole;
   created_at: number;
 }
 
@@ -26,6 +29,7 @@ export interface ClientRow {
   token_hash: string;
   token_prefix: string;
   node_id: string;
+  owner_id: string | null;
   created_at: number;
   last_seen_at: number | null;
 }
@@ -42,6 +46,11 @@ export interface TunnelRow {
   created_at: number;
 }
 
+export interface DomainRow {
+  domain: string;
+  tunnel_id: string;
+}
+
 type SqlValue = string | number | null;
 
 const SCHEMA = `
@@ -49,6 +58,7 @@ CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
   username TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'member',
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -63,6 +73,7 @@ CREATE TABLE IF NOT EXISTS clients (
   token_hash TEXT NOT NULL UNIQUE,
   token_prefix TEXT NOT NULL,
   node_id TEXT NOT NULL DEFAULT 'local',
+  owner_id TEXT,
   created_at INTEGER NOT NULL,
   last_seen_at INTEGER
 );
@@ -77,8 +88,13 @@ CREATE TABLE IF NOT EXISTS tunnels (
   enabled INTEGER NOT NULL DEFAULT 1,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tunnel_domains (
+  domain TEXT PRIMARY KEY,
+  tunnel_id TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_tunnels_client ON tunnels(client_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_domains_tunnel ON tunnel_domains(tunnel_id);
 `;
 
 export class Store {
@@ -91,10 +107,37 @@ export class Store {
     this.db = new DatabaseSync(file);
     this.db.exec('PRAGMA journal_mode = WAL;');
     this.db.exec(SCHEMA);
+    this.migrate();
   }
 
   close(): void {
     this.db.close();
+  }
+
+  /** 轻量迁移：SQLite 不支持 ADD COLUMN IF NOT EXISTS，这里按列名判断 */
+  private migrate(): void {
+    const userColumns = this.db.prepare('PRAGMA table_info(users)').all() as unknown as Array<{
+      name: string;
+    }>;
+    if (!userColumns.some((column) => column.name === 'role')) {
+      this.db.exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'member'");
+      // 老数据里的第一个账号原本就是管理员
+      this.db.exec(
+        "UPDATE users SET role = 'admin' WHERE id = (SELECT id FROM users ORDER BY created_at ASC LIMIT 1)",
+      );
+    }
+
+    const clientColumns = this.db.prepare('PRAGMA table_info(clients)').all() as unknown as Array<{
+      name: string;
+    }>;
+    if (!clientColumns.some((column) => column.name === 'owner_id')) {
+      this.db.exec('ALTER TABLE clients ADD COLUMN owner_id TEXT');
+    }
+    // 历史客户端归属到第一个管理员，避免升级后无人可见
+    this.db.exec(
+      "UPDATE clients SET owner_id = (SELECT id FROM users WHERE role = 'admin' ORDER BY created_at ASC LIMIT 1) WHERE owner_id IS NULL",
+    );
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_clients_owner ON clients(owner_id)');
   }
 
   // ---------- users & sessions ----------
@@ -104,10 +147,19 @@ export class Store {
     return Number(row.n);
   }
 
+  countAdmins(): number {
+    const row = this.db
+      .prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'admin'")
+      .get() as { n: number };
+    return Number(row.n);
+  }
+
   createUser(user: UserRow): void {
     this.db
-      .prepare('INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)')
-      .run(user.id, user.username, user.password_hash, user.created_at);
+      .prepare(
+        'INSERT INTO users (id, username, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)',
+      )
+      .run(user.id, user.username, user.password_hash, user.role, user.created_at);
   }
 
   findUserByUsername(username: string): UserRow | undefined {
@@ -118,6 +170,36 @@ export class Store {
 
   findUserById(id: string): UserRow | undefined {
     return this.db.prepare('SELECT * FROM users WHERE id = ?').get(id) as UserRow | undefined;
+  }
+
+  listUsers(): UserRow[] {
+    return this.db
+      .prepare('SELECT * FROM users ORDER BY created_at ASC')
+      .all() as unknown as UserRow[];
+  }
+
+  updateUserPassword(id: string, passwordHash: string): void {
+    this.db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(passwordHash, id);
+  }
+
+  updateUserRole(id: string, role: UserRole): void {
+    this.db.prepare('UPDATE users SET role = ? WHERE id = ?').run(role, id);
+  }
+
+  /** 删除账号并把其客户端移交给指定管理员，同时清理会话 */
+  deleteUser(id: string, reassignTo: string | null): void {
+    this.db.exec('BEGIN');
+    try {
+      if (reassignTo) {
+        this.db.prepare('UPDATE clients SET owner_id = ? WHERE owner_id = ?').run(reassignTo, id);
+      }
+      this.db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
+      this.db.prepare('DELETE FROM users WHERE id = ?').run(id);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   createSession(session: SessionRow): void {
@@ -136,6 +218,10 @@ export class Store {
     this.db.prepare('DELETE FROM sessions WHERE id = ?').run(id);
   }
 
+  deleteUserSessions(userId: string): void {
+    this.db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
+  }
+
   deleteExpiredSessions(now: number): void {
     this.db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(now);
   }
@@ -143,7 +229,15 @@ export class Store {
   // ---------- clients ----------
 
   listClients(): ClientRow[] {
-    return this.db.prepare('SELECT * FROM clients ORDER BY created_at ASC').all() as unknown as ClientRow[];
+    return this.db
+      .prepare('SELECT * FROM clients ORDER BY created_at ASC')
+      .all() as unknown as ClientRow[];
+  }
+
+  listClientsByOwner(ownerId: string): ClientRow[] {
+    return this.db
+      .prepare('SELECT * FROM clients WHERE owner_id = ? ORDER BY created_at ASC')
+      .all(ownerId) as unknown as ClientRow[];
   }
 
   findClient(id: string): ClientRow | undefined {
@@ -159,8 +253,8 @@ export class Store {
   createClient(client: ClientRow): void {
     this.db
       .prepare(
-        `INSERT INTO clients (id, name, note, token_hash, token_prefix, node_id, created_at, last_seen_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO clients (id, name, note, token_hash, token_prefix, node_id, owner_id, created_at, last_seen_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         client.id,
@@ -169,6 +263,7 @@ export class Store {
         client.token_hash,
         client.token_prefix,
         client.node_id,
+        client.owner_id,
         client.created_at,
         client.last_seen_at,
       );
@@ -202,6 +297,9 @@ export class Store {
   deleteClient(id: string): void {
     this.db.exec('BEGIN');
     try {
+      this.db
+        .prepare('DELETE FROM tunnel_domains WHERE tunnel_id IN (SELECT id FROM tunnels WHERE client_id = ?)')
+        .run(id);
       this.db.prepare('DELETE FROM tunnels WHERE client_id = ?').run(id);
       this.db.prepare('DELETE FROM clients WHERE id = ?').run(id);
       this.db.exec('COMMIT');
@@ -214,7 +312,9 @@ export class Store {
   // ---------- tunnels ----------
 
   listTunnels(): TunnelRow[] {
-    return this.db.prepare('SELECT * FROM tunnels ORDER BY created_at ASC').all() as unknown as TunnelRow[];
+    return this.db
+      .prepare('SELECT * FROM tunnels ORDER BY created_at ASC')
+      .all() as unknown as TunnelRow[];
   }
 
   listTunnelsByClient(clientId: string): TunnelRow[] {
@@ -227,10 +327,10 @@ export class Store {
     return this.db.prepare('SELECT * FROM tunnels WHERE id = ?').get(id) as TunnelRow | undefined;
   }
 
-  findTunnelByRemotePort(port: number): TunnelRow | undefined {
-    return this.db.prepare('SELECT * FROM tunnels WHERE remote_port = ?').get(port) as
-      | TunnelRow
-      | undefined;
+  findTunnelByRemotePort(port: number, protocol: string): TunnelRow | undefined {
+    return this.db
+      .prepare('SELECT * FROM tunnels WHERE remote_port = ? AND protocol = ?')
+      .get(port, protocol) as TunnelRow | undefined;
   }
 
   createTunnel(tunnel: TunnelRow): void {
@@ -276,6 +376,53 @@ export class Store {
   }
 
   deleteTunnel(id: string): void {
-    this.db.prepare('DELETE FROM tunnels WHERE id = ?').run(id);
+    this.db.exec('BEGIN');
+    try {
+      this.db.prepare('DELETE FROM tunnel_domains WHERE tunnel_id = ?').run(id);
+      this.db.prepare('DELETE FROM tunnels WHERE id = ?').run(id);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  // ---------- http domains ----------
+
+  listAllDomains(): DomainRow[] {
+    return this.db
+      .prepare('SELECT domain, tunnel_id FROM tunnel_domains')
+      .all() as unknown as DomainRow[];
+  }
+
+  listTunnelDomains(tunnelId: string): string[] {
+    const rows = this.db
+      .prepare('SELECT domain FROM tunnel_domains WHERE tunnel_id = ? ORDER BY domain ASC')
+      .all(tunnelId) as unknown as Array<{ domain: string }>;
+    return rows.map((row) => row.domain);
+  }
+
+  findTunnelIdByDomain(domain: string): string | undefined {
+    const row = this.db
+      .prepare('SELECT tunnel_id FROM tunnel_domains WHERE domain = ?')
+      .get(domain) as { tunnel_id: string } | undefined;
+    return row?.tunnel_id;
+  }
+
+  setTunnelDomains(tunnelId: string, domains: string[]): void {
+    this.db.exec('BEGIN');
+    try {
+      this.db.prepare('DELETE FROM tunnel_domains WHERE tunnel_id = ?').run(tunnelId);
+      const insert = this.db.prepare(
+        'INSERT INTO tunnel_domains (domain, tunnel_id) VALUES (?, ?)',
+      );
+      for (const domain of domains) {
+        insert.run(domain, tunnelId);
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 }

@@ -18,10 +18,13 @@ export type FrameType = (typeof FRAME)[keyof typeof FRAME];
 
 const HEADER_SIZE = 5;
 
+/** tcp/http 在 Agent 侧都连接本地 TCP 端口，udp 使用本地 UDP 端口 */
+export type TunnelProtocol = 'tcp' | 'udp' | 'http';
+
 export interface TunnelSpec {
   id: string;
   name: string;
-  protocol: 'tcp';
+  protocol: TunnelProtocol;
   localHost: string;
   localPort: number;
 }

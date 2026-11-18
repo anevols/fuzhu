@@ -13,6 +13,7 @@ import {
   type OpenErrorPayload,
   type OpenRequest,
   type SyncPayload,
+  type TunnelProtocol,
   type TunnelSpec,
 } from '@tunnel/protocol';
 import type { Store, TunnelRow } from './db';
@@ -90,7 +91,7 @@ function toSpec(tunnel: TunnelRow): TunnelSpec {
   return {
     id: tunnel.id,
     name: tunnel.name,
-    protocol: 'tcp',
+    protocol: tunnel.protocol as TunnelProtocol,
     localHost: tunnel.local_host,
     localPort: tunnel.local_port,
   };

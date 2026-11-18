@@ -3,12 +3,45 @@ export interface Traffic {
   outbound: number;
 }
 
+export type UserRole = 'admin' | 'member';
+
+export interface UserInfo {
+  id: string;
+  username: string;
+  role: UserRole;
+  createdAt?: string;
+  clientCount?: number;
+}
+
+export type TunnelProtocol = 'tcp' | 'udp' | 'http';
+
+export interface CertInfo {
+  domain: string;
+  mode: 'acme' | 'self-signed' | 'pending' | 'error';
+  expiresAt: string | null;
+  updatedAt: string | null;
+  error: string | null;
+}
+
+export interface HttpRouterInfo {
+  enabled: boolean;
+  port: number;
+  httpsPort: number;
+  listening: boolean;
+  httpsListening: boolean;
+  error: string | null;
+  httpsError: string | null;
+  acme: boolean;
+}
+
 export interface ClientInfo {
   id: string;
   name: string;
   note: string;
   tokenPrefix: string;
   nodeId: string;
+  ownerId: string | null;
+  ownerName: string | null;
   online: boolean;
   createdAt: string | null;
   lastSeenAt: string | null;
@@ -23,10 +56,12 @@ export interface TunnelInfo {
   clientId: string;
   clientName: string;
   name: string;
-  protocol: string;
+  protocol: TunnelProtocol;
   localHost: string;
   localPort: number;
   remotePort: number;
+  domains: string[];
+  certs: CertInfo[];
   enabled: boolean;
   status: TunnelStatus;
   error: string | null;
@@ -45,6 +80,7 @@ export interface OverviewResponse {
     totalClients: number;
     totalTunnels: number;
     listeningPorts: number[];
+    http: HttpRouterInfo;
   };
   clients: ClientInfo[];
   tunnels: TunnelInfo[];
@@ -53,9 +89,11 @@ export interface OverviewResponse {
 export interface TunnelInput {
   clientId: string;
   name: string;
+  protocol: TunnelProtocol;
   localHost: string;
   localPort: number;
-  remotePort: number;
+  remotePort?: number;
+  domains?: string[];
   enabled?: boolean;
 }
 
@@ -105,10 +143,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  me: () => request<{ user: { username: string } }>('/api/auth/me'),
+  me: () => request<{ user: UserInfo }>('/api/auth/me'),
 
   login: (username: string, password: string) =>
-    request<{ user: { username: string } }>('/api/auth/login', {
+    request<{ user: UserInfo }>('/api/auth/login', {
       method: 'POST',
       body: JSON.stringify({ username, password }),
     }),
@@ -141,7 +179,7 @@ export const api = {
       body: JSON.stringify(input),
     }),
 
-  updateTunnel: (id: string, input: Partial<Omit<TunnelInput, 'clientId'>>) =>
+  updateTunnel: (id: string, input: Partial<Omit<TunnelInput, 'clientId' | 'protocol'>>) =>
     request<{ tunnel: TunnelInfo | null }>(`/api/tunnels/${id}`, {
       method: 'PATCH',
       body: JSON.stringify(input),
@@ -149,4 +187,21 @@ export const api = {
 
   deleteTunnel: (id: string) =>
     request<{ ok: boolean }>(`/api/tunnels/${id}`, { method: 'DELETE' }),
+
+  users: () => request<{ users: UserInfo[] }>('/api/users'),
+
+  createUser: (input: { username: string; password: string; role: UserRole }) =>
+    request<{ user: UserInfo }>('/api/users', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+
+  updateUser: (id: string, input: { password?: string; role?: UserRole }) =>
+    request<{ user: UserInfo | null }>(`/api/users/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(input),
+    }),
+
+  deleteUser: (id: string) =>
+    request<{ ok: boolean }>(`/api/users/${id}`, { method: 'DELETE' }),
 };
