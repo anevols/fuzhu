@@ -19,8 +19,28 @@ async function main(): Promise<void> {
 
   const app = Fastify({
     logger: { level: config.logLevel },
-    trustProxy: true,
+    trustProxy: config.trustProxy,
     bodyLimit: 1024 * 1024,
+  });
+
+  app.addHook('onSend', async (request, reply, payload) => {
+    reply.header('x-content-type-options', 'nosniff');
+    reply.header('x-frame-options', 'DENY');
+    reply.header('referrer-policy', 'no-referrer');
+    reply.header('permissions-policy', 'geolocation=(), microphone=(), camera=()');
+    if (!request.url.startsWith('/api/')) {
+      reply.header(
+        'content-security-policy',
+        "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'",
+      );
+    }
+    const forwardedProto = request.headers['x-forwarded-proto'];
+    const isHttps =
+      request.protocol === 'https' || (config.trustProxy && forwardedProto === 'https');
+    if (isHttps) {
+      reply.header('strict-transport-security', 'max-age=31536000; includeSubDomains');
+    }
+    return payload;
   });
 
   const traffic = new TrafficStore();

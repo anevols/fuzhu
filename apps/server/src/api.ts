@@ -17,6 +17,7 @@ import {
 const SESSION_COOKIE = 'tunnel_sid';
 const LOGIN_WINDOW_MS = 5 * 60 * 1000;
 const LOGIN_MAX_FAILURES = 10;
+const LOGIN_MAX_TRACKED = 10_000;
 
 class ApiError extends Error {
   constructor(
@@ -159,6 +160,18 @@ function normalizeDomains(input: string[]): string[] {
 export function registerApi(app: FastifyInstance, deps: ApiDeps): void {
   const { store, hub, tunnelManager, traffic, config } = deps;
   const loginFailures = new Map<string, { count: number; resetAt: number }>();
+
+  function pruneLoginFailures(now: number): void {
+    if (loginFailures.size < LOGIN_MAX_TRACKED) return;
+    for (const [key, item] of loginFailures) {
+      if (item.resetAt <= now) loginFailures.delete(key);
+    }
+    while (loginFailures.size >= LOGIN_MAX_TRACKED) {
+      const oldest = loginFailures.keys().next().value;
+      if (!oldest) break;
+      loginFailures.delete(oldest);
+    }
+  }
 
   app.addHook('onSend', async (request, reply, payload) => {
     if (request.url.startsWith('/api/')) {
@@ -319,8 +332,11 @@ export function registerApi(app: FastifyInstance, deps: ApiDeps): void {
 
   app.post('/api/auth/login', async (request, reply) => {
     const ip = request.ip;
+    const now = Date.now();
+    pruneLoginFailures(now);
     const failure = loginFailures.get(ip);
-    if (failure && failure.resetAt > Date.now() && failure.count >= LOGIN_MAX_FAILURES) {
+    if (failure && failure.resetAt > now && failure.count >= LOGIN_MAX_FAILURES) {
+      reply.header('retry-after', String(Math.ceil((failure.resetAt - now) / 1000)));
       throw new ApiError(429, '尝试次数过多，请 5 分钟后再试');
     }
 
@@ -328,10 +344,10 @@ export function registerApi(app: FastifyInstance, deps: ApiDeps): void {
     const user = store.findUserByUsername(username);
     if (!user || !verifyPassword(password, user.password_hash)) {
       const current = loginFailures.get(ip);
-      if (current && current.resetAt > Date.now()) {
+      if (current && current.resetAt > now) {
         current.count += 1;
       } else {
-        loginFailures.set(ip, { count: 1, resetAt: Date.now() + LOGIN_WINDOW_MS });
+        loginFailures.set(ip, { count: 1, resetAt: now + LOGIN_WINDOW_MS });
       }
       throw new ApiError(401, '用户名或密码错误');
     }

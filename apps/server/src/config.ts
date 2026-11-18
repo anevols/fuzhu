@@ -19,6 +19,8 @@ export const config = {
   adminUsername: process.env.ADMIN_USERNAME ?? 'admin',
   adminPassword: process.env.ADMIN_PASSWORD ?? '',
   cookieSecure: process.env.COOKIE_SECURE === 'true',
+  /** 仅在控制台位于反向代理之后时开启，直接暴露时保持 false 防止伪造 X-Forwarded-For */
+  trustProxy: process.env.TRUST_PROXY === 'true',
   sessionTtlMs: 7 * 24 * 60 * 60 * 1000,
   logLevel: process.env.LOG_LEVEL ?? 'info',
   /** HTTP 域名路由与 HTTPS 终止共用的公网端口 */

@@ -123,6 +123,7 @@ pnpm typecheck
 | `ADMIN_USERNAME` | `admin` | 首次初始化管理员用户名 |
 | `ADMIN_PASSWORD` | 随机 | 首次初始化管理员密码，仅首次生效 |
 | `COOKIE_SECURE` | `false` | HTTPS 部署时设为 `true` |
+| `TRUST_PROXY` | `false` | 仅在 Nginx/Caddy 等反向代理之后设为 `true`；直接暴露时保持 `false`，否则登录限流可被伪造的 `X-Forwarded-For` 绕过 |
 | `WEB_DIST` | `../web/dist` | 前端构建产物路径 |
 | `LOG_LEVEL` | `info` | pino 日志级别 |
 
@@ -145,11 +146,22 @@ Agent 参数 / 环境变量：
 
 ## 生产部署建议
 
-- 用 Nginx/Caddy 反向代理 8787 并启用 HTTPS，Agent 使用 `wss://`，同时设置 `COOKIE_SECURE=true`
+- 用 Nginx/Caddy 反向代理 8787 并启用 HTTPS，Agent 使用 `wss://`，同时设置 `COOKIE_SECURE=true` 和 `TRUST_PROXY=true`
 - 只开放 8787 和需要的隧道端口，其余端口在防火墙限制来源
 - 令牌放在环境变量或受保护的配置文件中，不要写在命令行参数里
 - 不要把数据库、RDP 等敏感服务直接暴露公网，建议叠加 VPN 或 IP 白名单
 - 定期备份 `DATA_DIR/tunnel.db`
+
+### Docker 部署
+
+```bash
+ADMIN_PASSWORD='请换成强密码' docker compose up -d --build
+```
+
+- 数据与证书保存在 `tunnel-data` 卷，重建容器不会丢失
+- 隧道端口是动态的，Linux 下 compose 使用 `network_mode: host`，无需逐个映射端口
+- 需要 Let's Encrypt 时追加 `ACME_EMAIL=you@example.com`
+- 容器内已带健康检查：`docker compose ps` 可看到 `healthy`
 
 Nginx 示例：
 
@@ -165,6 +177,7 @@ server {
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
   }
 
   location /agent {
@@ -172,6 +185,7 @@ server {
     proxy_http_version 1.1;
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection "upgrade";
+    proxy_set_header X-Forwarded-Proto $scheme;
     proxy_read_timeout 3600s;
   }
 }
@@ -197,6 +211,8 @@ server {
 - 管理密码使用 scrypt 加盐哈希
 - Agent 令牌只存哈希，轮换后旧令牌立即失效并断开 Agent
 - 会话 Cookie 为 `httpOnly` + `SameSite=Lax`
-- 登录失败按来源 IP 限速
+- 登录失败按来源 IP 限速；`TRUST_PROXY` 默认关闭，避免通过伪造 `X-Forwarded-For` 绕过
+- 管理台响应附带 CSP、`X-Frame-Options`、`X-Content-Type-Options` 等安全头
+- 隧道数据链路带背压控制，服务端每 30 秒做一次 WebSocket 心跳探测并清理死连接
 - 成员数据在 API 层强制隔离，越权访问返回 404
 - 生产环境请务必启用 HTTPS/WSS，并限制公网暴露的隧道端口；HTTP 隧道使用 ACME 证书时需保证 80 端口可从公网访问

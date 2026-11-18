@@ -18,6 +18,8 @@ import {
 const VERSION = '0.1.0';
 const HEARTBEAT_MS = 25_000;
 const CONNECT_TIMEOUT_MS = 15_000;
+const WS_HIGH_WATER = 4 * 1024 * 1024;
+const WS_LOW_WATER = 1024 * 1024;
 
 interface Options {
   server: string;
@@ -109,6 +111,8 @@ class Agent {
   private reconnectAttempt = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private heartbeat: NodeJS.Timeout | null = null;
+  private backpressureTimer: NodeJS.Timeout | null = null;
+  private readonly pausedSockets = new Set<net.Socket>();
   private stopped = false;
 
   constructor(private readonly options: Options) {}
@@ -145,6 +149,14 @@ class Agent {
       this.heartbeat = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) ws.ping();
       }, HEARTBEAT_MS);
+      this.backpressureTimer = setInterval(() => {
+        if (!this.ws || this.ws.bufferedAmount > WS_LOW_WATER) return;
+        for (const socket of this.pausedSockets) {
+          this.pausedSockets.delete(socket);
+          if (!socket.destroyed) socket.resume();
+        }
+      }, 100);
+      this.backpressureTimer.unref();
     });
 
     ws.on('message', (data, isBinary) => {
@@ -193,8 +205,19 @@ class Agent {
         break;
       case FRAME.Data: {
         const udp = this.udpStreams.get(streamId);
-        if (udp) udp.send(payload);
-        else this.streams.get(streamId)?.write(payload);
+        if (udp) {
+          udp.send(payload);
+          break;
+        }
+        const socket = this.streams.get(streamId);
+        if (!socket || socket.destroyed) break;
+        if (!socket.write(payload)) {
+          const ws = this.ws;
+          ws?.pause();
+          socket.once('drain', () => {
+            if (ws && ws.readyState === WebSocket.OPEN) ws.resume();
+          });
+        }
         break;
       }
       case FRAME.Close: {
@@ -278,6 +301,10 @@ class Agent {
 
     socket.on('data', (chunk: Buffer) => {
       this.sendFrame(FRAME.Data, streamId, chunk);
+      if (!this.pausedSockets.has(socket) && this.ws && this.ws.bufferedAmount > WS_HIGH_WATER) {
+        this.pausedSockets.add(socket);
+        socket.pause();
+      }
     });
 
     socket.on('close', () => {
@@ -372,6 +399,11 @@ class Agent {
       clearInterval(this.heartbeat);
       this.heartbeat = null;
     }
+    if (this.backpressureTimer) {
+      clearInterval(this.backpressureTimer);
+      this.backpressureTimer = null;
+    }
+    this.pausedSockets.clear();
     for (const socket of this.streams.values()) {
       socket.destroy();
     }

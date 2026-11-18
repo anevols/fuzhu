@@ -85,7 +85,12 @@ interface ServerStream {
   tunnelId: string;
   socket: Socket;
   opened: boolean;
+  paused: boolean;
 }
+
+const WS_HIGH_WATER = 4 * 1024 * 1024;
+const WS_LOW_WATER = 1024 * 1024;
+const WS_HEARTBEAT_MS = 30_000;
 
 function toSpec(tunnel: TunnelRow): TunnelSpec {
   return {
@@ -108,6 +113,9 @@ class MuxConnection {
   private readonly streams = new Map<number, ServerStream>();
   private nextStreamId = 1;
   private authTimer: NodeJS.Timeout | null = null;
+  private heartbeatTimer: NodeJS.Timeout | null = null;
+  private backpressureTimer: NodeJS.Timeout | null = null;
+  private alive = true;
 
   clientId = '';
   clientName = '';
@@ -126,6 +134,7 @@ class MuxConnection {
     }, 10_000);
 
     this.ws.on('message', (data, isBinary) => {
+      this.alive = true;
       if (!isBinary) {
         this.ws.close(4005, 'binary frames required');
         return;
@@ -139,6 +148,27 @@ class MuxConnection {
       }
       this.handleFrame(frame);
     });
+
+    this.ws.on('pong', () => {
+      this.alive = true;
+    });
+
+    this.heartbeatTimer = setInterval(() => {
+      if (!this.alive) {
+        this.ws.terminate();
+        return;
+      }
+      this.alive = false;
+      try {
+        this.ws.ping();
+      } catch {
+        this.ws.terminate();
+      }
+    }, WS_HEARTBEAT_MS);
+    this.heartbeatTimer.unref();
+
+    this.backpressureTimer = setInterval(() => this.resumeBackpressured(), 100);
+    this.backpressureTimer.unref();
 
     this.ws.on('close', () => this.handleClose());
     this.ws.on('error', (error) => {
@@ -163,7 +193,7 @@ class MuxConnection {
     const id = this.nextStreamId++;
     if (this.nextStreamId > 0xffffffff) this.nextStreamId = 1;
 
-    const stream: ServerStream = { id, tunnelId: tunnel.id, socket, opened: false };
+    const stream: ServerStream = { id, tunnelId: tunnel.id, socket, opened: false, paused: false };
     this.streams.set(id, stream);
 
     socket.pause();
@@ -176,6 +206,10 @@ class MuxConnection {
       if (!stream.opened) return;
       this.hub.traffic.addInbound(tunnel.id, chunk.length);
       this.sendFrame(FRAME.Data, id, chunk);
+      if (!stream.paused && this.ws.bufferedAmount > WS_HIGH_WATER) {
+        stream.paused = true;
+        socket.pause();
+      }
     });
     socket.on('close', () => this.dropStream(id, true));
     socket.on('end', () => this.dropStream(id, true));
@@ -274,7 +308,21 @@ class MuxConnection {
     const stream = this.streams.get(frame.streamId);
     if (!stream || !stream.opened) return;
     this.hub.traffic.addOutbound(stream.tunnelId, frame.payload.length);
-    stream.socket.write(frame.payload);
+    if (!stream.socket.write(frame.payload) && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.pause();
+      stream.socket.once('drain', () => {
+        if (this.ws.readyState === WebSocket.OPEN) this.ws.resume();
+      });
+    }
+  }
+
+  private resumeBackpressured(): void {
+    if (this.ws.bufferedAmount > WS_LOW_WATER) return;
+    for (const stream of this.streams.values()) {
+      if (!stream.paused) continue;
+      stream.paused = false;
+      if (stream.opened && !stream.socket.destroyed) stream.socket.resume();
+    }
   }
 
   private dropStream(streamId: number, notifyAgent: boolean): void {
@@ -297,6 +345,15 @@ class MuxConnection {
       clearTimeout(this.authTimer);
       this.authTimer = null;
     }
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+    if (this.backpressureTimer) {
+      clearInterval(this.backpressureTimer);
+      this.backpressureTimer = null;
+    }
+    this.alive = false;
     for (const id of [...this.streams.keys()]) {
       this.dropStream(id, false);
     }

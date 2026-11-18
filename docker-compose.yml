@@ -1,0 +1,22 @@
+services:
+  tunnel-console:
+    build: .
+    container_name: tunnel-console
+    # 隧道会监听任意 TCP/UDP 端口，Linux 下建议使用 host 网络。
+    # macOS / Windows 请改用端口映射，并显式列出需要暴露的端口段。
+    network_mode: host
+    environment:
+      PORT: "8787"
+      DATA_DIR: /data
+      ADMIN_USERNAME: admin
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?请先设置 ADMIN_PASSWORD}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      # 仅当控制台位于 Nginx/Caddy 之后时设为 true
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    volumes:
+      - tunnel-data:/data
+    restart: unless-stopped
+
+volumes:
+  tunnel-data:
